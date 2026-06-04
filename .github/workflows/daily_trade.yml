@@ -2,9 +2,12 @@ name: Congress Trader – Täglicher Lauf
 
 on:
   schedule:
-    # Jeden Wochentag um 15:35 UTC = 09:35 EST (5 Min nach Marktöffnung)
+    # Jeden Wochentag um 14:35 UTC = 09:35 EST (5 Min nach Marktöffnung)
     - cron: "35 14 * * 1-5"
-  workflow_dispatch:  # Manuell auslösbar über GitHub UI
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   trade:
