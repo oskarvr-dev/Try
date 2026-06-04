@@ -311,7 +311,7 @@ def main():
     # 2. Markt offen?
     if not is_market_open():
         print("Markt ist geschlossen – kein Handel heute.")
-        html = build_email("Congress Trader – Markt geschlossen", account)
+        html = build_email([], [], account)
         # Trotzdem Mail mit Kontostand senden
         politicians = fetch_politicians()
         send_email(
