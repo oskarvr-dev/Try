@@ -128,11 +128,13 @@ def fetch_sec_insider_trades():
             name = title.split(" - ")[1].split(" (")[0] if " - " in title else title
 
             if ticker:
+                # Jedes Issuer-Entry zaehlt als potenzieller Kauf (Form 4 P-Transaktion)
                 trades.append({
                     "name":   name,
                     "ticker": ticker,
                     "date":   updated,
                     "type":   "purchase",
+                    "score":  50,
                     "link":   link
                 })
 
@@ -220,16 +222,25 @@ def rank_insiders(trades):
 
     result = []
     for name, p in pols.items():
+        if not p["tickers"] and not p["last_5_trades"]:
+            continue
+        # Tickers aus last_5_trades auffuellen falls leer
+        if not p["tickers"]:
+            p["tickers"] = list(dict.fromkeys(
+                t["ticker"] for t in p["last_5_trades"] if t.get("ticker")
+            ))
         if not p["tickers"]:
             continue
         if not p["score"]:
             total = p["buy_count"] + p["sell_count"]
-            p["score"] = round((p["buy_count"] / max(total, 1)) * 100, 1)
+            p["score"] = round((p["buy_count"] / max(total, 1)) * 100, 1) if total > 0 else 50.0
         p["trade_count"] = p["buy_count"] + p["sell_count"]
         result.append(p)
 
     result.sort(key=lambda x: x["score"], reverse=True)
     print(f"  {len(result)} Insider ausgewertet")
+    for r in result[:5]:
+        print(f"    {r['name']} score={r['score']} tickers={r['tickers']}")
     return result
 
 # ── Portfolio spiegeln ─────────────────────────────────────────────────────────
