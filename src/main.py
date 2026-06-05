@@ -123,7 +123,12 @@ def rank_politicians(trades):
         if not ticker or not ticker.replace(".", "").isalpha() or len(ticker) > 5:
             continue
         try:
-            td = datetime.date.fromisoformat(date_s)
+            # Format MM/DD/YYYY oder YYYY-MM-DD
+            if "/" in date_s:
+                parts = date_s.split("/")
+                td = datetime.date(int(parts[2]), int(parts[0]), int(parts[1]))
+            else:
+                td = datetime.date.fromisoformat(date_s)
         except Exception:
             continue
         if td < cutoff:
