@@ -30,9 +30,9 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 
 # Datenquellen (werden der Reihe nach versucht)
 DATA_SOURCES = [
-    "https://senate-stock-watcher-data.s3-us-east-2.amazonaws.com/aggregate/all_transactions.json",
-    "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json",
-    "https://raw.githubusercontent.com/senateStockWatcher/senate-stock-watcher/main/data/all_transactions.json",
+    "https://senatestockwatcher.com/api",
+    "https://housestockwatcher.com/api",
+    "https://raw.githubusercontent.com/timothycarambat/senate-stock-watcher-data/master/aggregate/all_transactions.json",
 ]
 
 # ── Alpaca ─────────────────────────────────────────────────────────────────────
