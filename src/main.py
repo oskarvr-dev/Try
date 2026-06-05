@@ -1,6 +1,6 @@
 """
 Congress Trader - Spiegelt Positionen aktiver Kongressmitglieder
-Datenquelle: quiverquant.com (kostenlose API)
+Datenquelle: Senate Stock Watcher (kostenlos, kein Login)
 Broker: Alpaca Paper Trading
 """
 
@@ -26,11 +26,16 @@ TOP_N_POLITICIANS  = 3
 MAX_POSITION_PCT   = 0.05
 LOOKBACK_DAYS      = 365
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-}
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-# ── Alpaca Hilfsfunktionen ─────────────────────────────────────────────────────
+# Datenquellen (werden der Reihe nach versucht)
+DATA_SOURCES = [
+    "https://senate-stock-watcher-data.s3-us-east-2.amazonaws.com/aggregate/all_transactions.json",
+    "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json",
+    "https://raw.githubusercontent.com/senateStockWatcher/senate-stock-watcher/main/data/all_transactions.json",
+]
+
+# ── Alpaca ─────────────────────────────────────────────────────────────────────
 
 def alpaca_get(endpoint):
     r = requests.get(
@@ -59,228 +64,209 @@ def get_positions():
 
 def place_order(symbol, notional, side="buy"):
     payload = {
-        "symbol":   symbol,
+        "symbol": symbol,
         "notional": str(round(notional, 2)),
-        "side":     side,
-        "type":     "market",
+        "side": side,
+        "type": "market",
         "time_in_force": "day"
     }
     print(f"  Order: {side.upper()} {symbol} fuer ${notional:.2f}")
     return alpaca_post("/orders", payload)
 
 def is_market_open():
-    data = alpaca_get("/clock")
-    return data.get("is_open", False)
+    return alpaca_get("/clock").get("is_open", False)
 
-# ── Congress Trades API (Quiver Quantitative) ──────────────────────────────────
+# ── Daten laden ────────────────────────────────────────────────────────────────
 
-def fetch_congress_trades():
-    """
-    Lädt Kongress-Trades der letzten 12 Monate von der
-    öffentlichen Quiver Quantitative API.
-    """
-    print("Lade Kongress-Trades von quiverquant.com ...")
-    url = "https://api.quiverquant.com/beta/live/congresstrading"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        trades = resp.json()
-        print(f"  {len(trades)} Trades geladen")
-        return trades
-    except Exception as e:
-        print(f"  Fehler: {e}")
-        # Fallback: Capitol Trades JSON-Endpunkt
+def fetch_trades():
+    for url in DATA_SOURCES:
+        print(f"Versuche: {url}")
         try:
-            url2 = "https://www.capitoltrades.com/api/trades?pageSize=500"
-            resp2 = requests.get(url2, headers=HEADERS, timeout=20)
-            resp2.raise_for_status()
-            data = resp2.json()
-            trades = data.get("trades", data) if isinstance(data, dict) else data
-            print(f"  {len(trades)} Trades geladen (Fallback)")
-            return trades
-        except Exception as e2:
-            print(f"  Fallback fehlgeschlagen: {e2}")
-            return []
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            # Senate Stock Watcher gibt Liste von Personen-Objekten zurueck
+            trades = []
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and "transactions" in item:
+                        # Format: [{first_name, last_name, transactions: [...]}]
+                        name = f"{item.get('first_name','')} {item.get('last_name','')}".strip()
+                        for tx in item.get("transactions", []):
+                            tx["senator"] = name
+                            trades.append(tx)
+                    elif isinstance(item, dict) and "ticker" in item:
+                        # Flaches Format
+                        trades.append(item)
+            print(f"  {len(trades)} Trades geladen")
+            if trades:
+                return trades
+        except Exception as e:
+            print(f"  Fehler: {e}")
+    return []
 
 def rank_politicians(trades):
-    """
-    Gruppiert Trades nach Politiker und berechnet einen Score
-    basierend auf Kauf-Aktivität der letzten 12 Monate.
-    """
     cutoff = datetime.date.today() - datetime.timedelta(days=LOOKBACK_DAYS)
     recent_cutoff = datetime.date.today() - datetime.timedelta(days=90)
-
-    politicians = defaultdict(lambda: {
-        "name": "",
-        "trades": [],
-        "buy_count": 0,
-        "sell_count": 0,
-        "recent_buys": []
-    })
+    pols = defaultdict(lambda: {"name": "", "trades": [], "buy_count": 0, "sell_count": 0, "recent_buys": []})
 
     for t in trades:
-        # Quiver Quantitative Feldnamen
-        name      = t.get("Representative") or t.get("politician") or t.get("name", "Unbekannt")
-        ticker    = (t.get("Ticker") or t.get("ticker") or t.get("asset", "")).upper().strip()
-        tx_type   = (t.get("Transaction") or t.get("type") or t.get("transaction", "")).lower()
-        date_str  = t.get("TransactionDate") or t.get("date") or t.get("traded", "")[:10]
+        # Verschiedene Feldnamen abdecken
+        name   = (t.get("senator") or t.get("representative") or
+                  t.get("Representative") or t.get("name") or "Unbekannt").strip()
+        ticker = (t.get("ticker") or t.get("Ticker") or t.get("asset_ticker") or "").upper().strip()
+        txtype = (t.get("type") or t.get("transaction_type") or
+                  t.get("Transaction") or "").lower()
+        date_s = (t.get("transaction_date") or t.get("TransactionDate") or
+                  t.get("date") or t.get("disclosure_date") or "")[:10]
 
-        if not ticker or not ticker.isalpha():
+        if not ticker or not ticker.replace(".", "").isalpha() or len(ticker) > 5:
             continue
         try:
-            trade_date = datetime.date.fromisoformat(date_str[:10])
+            td = datetime.date.fromisoformat(date_s)
         except Exception:
             continue
-        if trade_date < cutoff:
+        if td < cutoff:
             continue
 
-        pol = politicians[name]
-        pol["name"] = name
-        pol["trades"].append({
-            "date": date_str[:10],
-            "ticker": ticker,
-            "type": tx_type
-        })
+        p = pols[name]
+        p["name"] = name
+        p["trades"].append({"date": date_s, "ticker": ticker, "type": txtype})
 
-        is_buy = "purchase" in tx_type or "buy" in tx_type
-        is_sell = "sell" in tx_type or "sale" in tx_type
+        is_buy = any(w in txtype for w in ["purchase", "buy", "bought"])
+        is_sell = any(w in txtype for w in ["sale", "sell", "sold"])
 
         if is_buy:
-            pol["buy_count"] += 1
-            if trade_date >= recent_cutoff:
-                pol["recent_buys"].append(ticker)
+            p["buy_count"] += 1
+            if td >= recent_cutoff:
+                p["recent_buys"].append(ticker)
         elif is_sell:
-            pol["sell_count"] += 1
+            p["sell_count"] += 1
 
-    # Score berechnen & sortieren
     result = []
-    for name, pol in politicians.items():
-        total = pol["buy_count"] + pol["sell_count"]
-        if total == 0:
+    for name, p in pols.items():
+        total = p["buy_count"] + p["sell_count"]
+        if total < 2:
             continue
-        score = (pol["buy_count"] - pol["sell_count"] * 0.5) / total * 100
-        pol["score"]       = round(score, 1)
-        pol["trade_count"] = total
-        pol["recent_buys"] = list(dict.fromkeys(pol["recent_buys"]))[:5]
-        pol["last_5_trades"] = sorted(pol["trades"], key=lambda x: x["date"], reverse=True)[:5]
-        result.append(pol)
+        score = (p["buy_count"] - p["sell_count"] * 0.5) / total * 100
+        result.append({
+            "name": name,
+            "score": round(score, 1),
+            "trade_count": total,
+            "buy_count": p["buy_count"],
+            "recent_buys": list(dict.fromkeys(p["recent_buys"]))[:5],
+            "last_5_trades": sorted(p["trades"], key=lambda x: x["date"], reverse=True)[:5]
+        })
 
-    result.sort(key=lambda x: x["score"], reverse=True)
+    result.sort(key=lambda x: (x["score"], x["trade_count"]), reverse=True)
     print(f"  {len(result)} Politiker ausgewertet")
     return result
 
-# ── Portfolio-Spiegelung ───────────────────────────────────────────────────────
+# ── Portfolio spiegeln ─────────────────────────────────────────────────────────
 
-def mirror_positions(top_politicians, account):
+def mirror_positions(politicians, account):
     portfolio_value = float(account["portfolio_value"])
-    budget_per_pol  = portfolio_value * MAX_POSITION_PCT
+    budget = portfolio_value * MAX_POSITION_PCT
     orders = []
-    existing = {p["symbol"]: p for p in get_positions()}
+    existing = {p["symbol"] for p in get_positions()}
 
-    for pol in top_politicians[:TOP_N_POLITICIANS]:
-        print(f"\nSpiegele Positionen von {pol['name']} ...")
-        tickers = pol["recent_buys"] or [t["ticker"] for t in pol["last_5_trades"] if "buy" in t["type"] or "purchase" in t["type"]][:5]
+    for pol in politicians[:TOP_N_POLITICIANS]:
+        tickers = pol["recent_buys"]
         if not tickers:
-            print(f"  Keine Kauf-Trades gefunden - ueberspringe")
+            tickers = [t["ticker"] for t in pol["last_5_trades"]
+                       if any(w in t["type"] for w in ["purchase", "buy"])][:3]
+        if not tickers:
+            print(f"  {pol['name']}: keine Kauf-Tickers gefunden")
             continue
-        budget_per_ticker = budget_per_pol / len(tickers)
+        per_ticker = budget / len(tickers)
+        print(f"\nSpiegele {pol['name']} ({len(tickers)} Tickers) ...")
         for ticker in tickers:
             if ticker in existing:
-                print(f"  {ticker} bereits im Portfolio - ueberspringe")
+                print(f"  {ticker} bereits im Portfolio")
                 continue
             try:
-                order = place_order(ticker, budget_per_ticker)
+                order = place_order(ticker, per_ticker)
                 orders.append({"politician": pol["name"], "ticker": ticker, "order": order})
                 time.sleep(0.5)
             except Exception as e:
-                print(f"  Order fuer {ticker} fehlgeschlagen: {e}")
+                print(f"  {ticker} fehlgeschlagen: {e}")
                 orders.append({"politician": pol["name"], "ticker": ticker, "error": str(e)})
-
     return orders
 
 # ── E-Mail ─────────────────────────────────────────────────────────────────────
 
-def send_email(subject, body_html):
+def send_email(subject, html):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"]    = EMAIL_FROM
-    msg["To"]      = EMAIL_TO
-    msg.attach(MIMEText(body_html, "html"))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(EMAIL_FROM, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg.attach(MIMEText(html, "html"))
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(EMAIL_FROM, EMAIL_PASSWORD)
+        s.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
     print(f"E-Mail gesendet an {EMAIL_TO}")
 
-def build_email(politicians, orders, account, market_open=True):
+def build_email(politicians, orders, account, market_open):
     today = datetime.date.today().strftime("%d.%m.%Y")
+
     rows_pol = ""
     for i, p in enumerate(politicians[:TOP_N_POLITICIANS], 1):
-        last5 = " | ".join([
+        last5 = " &nbsp;|&nbsp; ".join(
             f"{t['date']} <b>{t['ticker']}</b> ({t['type']})"
             for t in p.get("last_5_trades", [])
-        ]) or "-"
-        rows_pol += f"""
-        <tr>
-          <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:center">{i}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #eee"><b>{p['name']}</b></td>
-          <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:center">{p['trade_count']}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #eee;text-align:center">{p['score']}%</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:12px">{last5}</td>
+        ) or "-"
+        rows_pol += f"""<tr>
+          <td style="padding:8px;border-bottom:1px solid #eee;text-align:center">{i}</td>
+          <td style="padding:8px;border-bottom:1px solid #eee"><b>{p['name']}</b></td>
+          <td style="padding:8px;border-bottom:1px solid #eee;text-align:center">{p['trade_count']}</td>
+          <td style="padding:8px;border-bottom:1px solid #eee;text-align:center">{p['score']}%</td>
+          <td style="padding:8px;border-bottom:1px solid #eee;font-size:12px">{last5}</td>
         </tr>"""
 
-    rows_orders = ""
+    rows_ord = ""
     for o in orders:
-        status = "✅ Ausgefuehrt" if "order" in o else f"❌ {o.get('error','Fehler')}"
-        rows_orders += f"""
-        <tr>
-          <td style="padding:8px 12px;border-bottom:1px solid #eee">{o['politician']}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #eee"><b>{o['ticker']}</b></td>
-          <td style="padding:8px 12px;border-bottom:1px solid #eee">{status}</td>
+        st = "Ausgefuehrt" if "order" in o else f"Fehler: {o.get('error','')}"
+        rows_ord += f"""<tr>
+          <td style="padding:8px;border-bottom:1px solid #eee">{o['politician']}</td>
+          <td style="padding:8px;border-bottom:1px solid #eee"><b>{o['ticker']}</b></td>
+          <td style="padding:8px;border-bottom:1px solid #eee">{st}</td>
         </tr>"""
 
-    status_badge = (
-        '<span style="background:#22c55e;color:white;padding:3px 10px;border-radius:20px;font-size:12px">Markt offen</span>'
-        if market_open else
-        '<span style="background:#94a3b8;color:white;padding:3px 10px;border-radius:20px;font-size:12px">Markt geschlossen</span>'
-    )
+    badge = ('<span style="background:#22c55e;color:white;padding:3px 10px;border-radius:20px;font-size:12px">Markt offen</span>'
+             if market_open else
+             '<span style="background:#94a3b8;color:white;padding:3px 10px;border-radius:20px;font-size:12px">Markt geschlossen</span>')
 
-    html = f"""
-    <html><body style="font-family:Arial,sans-serif;max-width:750px;margin:auto;color:#333;">
-      <h2 style="background:#1a1a2e;color:white;padding:16px 24px;border-radius:8px;margin-bottom:4px;">
+    no_data = '<tr><td colspan="5" style="padding:16px;text-align:center;color:#888">Keine Daten verfuegbar</td></tr>'
+
+    return f"""<html><body style="font-family:Arial,sans-serif;max-width:750px;margin:auto;color:#333">
+      <h2 style="background:#1a1a2e;color:white;padding:16px 24px;border-radius:8px;margin-bottom:6px">
         Congress Trader - Tagesbericht {today}
       </h2>
-      <p style="margin:0 0 20px">{status_badge}</p>
-
+      <p>{badge}</p>
       <h3>Konto-Uebersicht</h3>
-      <table style="width:100%;border-collapse:collapse;margin-bottom:20px">
-        <tr><td style="padding:6px 0"><b>Portfolio-Wert</b></td><td>${float(account['portfolio_value']):,.2f}</td></tr>
-        <tr><td style="padding:6px 0"><b>Verfuegbares Kapital</b></td><td>${float(account['buying_power']):,.2f}</td></tr>
-        <tr><td style="padding:6px 0"><b>Unrealisierter P&L</b></td><td>${float(account.get('unrealized_pl',0)):,.2f}</td></tr>
+      <table style="width:100%;border-collapse:collapse;margin-bottom:16px">
+        <tr><td style="padding:5px 0"><b>Portfolio-Wert</b></td><td>${float(account['portfolio_value']):,.2f}</td></tr>
+        <tr><td style="padding:5px 0"><b>Verfuegbares Kapital</b></td><td>${float(account['buying_power']):,.2f}</td></tr>
+        <tr><td style="padding:5px 0"><b>Unrealisierter P&L</b></td><td>${float(account.get('unrealized_pl',0)):,.2f}</td></tr>
       </table>
-
-      <h3>Top {TOP_N_POLITICIANS} Kongressmitglieder (letzte 12 Monate)</h3>
-      <table style="width:100%;border-collapse:collapse;border:1px solid #eee;margin-bottom:20px">
-        <thead><tr style="background:#f5f5f5;">
-          <th style="padding:8px 12px">#</th>
-          <th style="padding:8px 12px">Name</th>
-          <th style="padding:8px 12px">Trades</th>
-          <th style="padding:8px 12px">Score</th>
-          <th style="padding:8px 12px">Letzte 5 Trades</th>
+      <h3>Top {TOP_N_POLITICIANS} Senatoren (letzte 12 Monate)</h3>
+      <table style="width:100%;border-collapse:collapse;border:1px solid #eee;margin-bottom:16px">
+        <thead><tr style="background:#f5f5f5">
+          <th style="padding:8px">#</th><th style="padding:8px">Name</th>
+          <th style="padding:8px">Trades</th><th style="padding:8px">Score</th>
+          <th style="padding:8px">Letzte 5 Trades</th>
         </tr></thead>
-        <tbody>{rows_pol if rows_pol else '<tr><td colspan="5" style="padding:16px;text-align:center;color:#888">Keine Daten verfuegbar</td></tr>'}</tbody>
+        <tbody>{rows_pol or no_data}</tbody>
       </table>
-
       <h3>Heutige Orders</h3>
       {"<p>Keine neuen Orders heute.</p>" if not orders else
-        '<table style="width:100%;border-collapse:collapse;border:1px solid #eee"><thead><tr style="background:#f5f5f5"><th style="padding:8px 12px">Politiker</th><th style="padding:8px 12px">Ticker</th><th style="padding:8px 12px">Status</th></tr></thead><tbody>' + rows_orders + '</tbody></table>'}
-
-      <p style="color:#888;font-size:12px;margin-top:32px;border-top:1px solid #eee;padding-top:12px">
+       f'<table style="width:100%;border-collapse:collapse;border:1px solid #eee"><thead><tr style="background:#f5f5f5"><th style="padding:8px">Politiker</th><th style="padding:8px">Ticker</th><th style="padding:8px">Status</th></tr></thead><tbody>{rows_ord}</tbody></table>'}
+      <p style="color:#888;font-size:12px;margin-top:24px;border-top:1px solid #eee;padding-top:12px">
         Congress Trader - Alpaca Paper Trading - Automatisch generiert
       </p>
     </body></html>"""
-    return html
 
-# ── Hauptprogramm ──────────────────────────────────────────────────────────────
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     print("=" * 60)
@@ -288,33 +274,28 @@ def main():
     print("=" * 60)
 
     account = get_account()
-    print(f"Portfolio: ${float(account['portfolio_value']):,.2f} | "
-          f"Buying Power: ${float(account['buying_power']):,.2f}")
+    print(f"Portfolio: ${float(account['portfolio_value']):,.2f} | Buying Power: ${float(account['buying_power']):,.2f}")
 
     market_open = is_market_open()
-
-    # Politiker-Daten immer laden (auch wenn Markt zu)
-    raw_trades = fetch_congress_trades()
-    politicians = rank_politicians(raw_trades)
+    trades = fetch_trades()
+    politicians = rank_politicians(trades)
 
     if politicians:
-        print(f"\nTop 5 Politiker:")
+        print("\nTop 5:")
         for i, p in enumerate(politicians[:5], 1):
-            print(f"  {i}. {p['name']} - Score {p['score']}%  "
-                  f"Letzte Kaeufe: {', '.join(p['recent_buys'][:3]) or '-'}")
+            print(f"  {i}. {p['name']} Score:{p['score']}% Trades:{p['trade_count']} Kaeufe:{p['recent_buys'][:3]}")
 
     orders = []
-    if market_open:
+    if market_open and politicians:
         orders = mirror_positions(politicians, account)
-        account = get_account()  # Aktualisiertes Konto nach Orders
+        account = get_account()
     else:
-        print("Markt ist geschlossen - kein Handel heute.")
+        print("Markt geschlossen oder keine Daten - kein Handel.")
 
     send_email(
         f"Congress Trader {datetime.date.today():%d.%m.%Y} - {'Markt offen' if market_open else 'Markt geschlossen'}",
         build_email(politicians[:TOP_N_POLITICIANS], orders, account, market_open)
     )
-
     print("\nFertig!")
 
 if __name__ == "__main__":
