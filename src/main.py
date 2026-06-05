@@ -155,21 +155,23 @@ def fetch_politician_detail(url):
     sell_count = sum(1 for t in trades if "sell" in t["type"])
     return_est = (buy_count - sell_count * 0.5) / max(len(trades), 1) * 100
 
-    recent_cutoff = datetime.date.today() - datetime.timedelta(days=30)
-    recent_buys = [
+    # Letzte 5 Kaeufe (unabhaengig vom Datum)
+    recent_buys = list(dict.fromkeys([
         t["ticker"] for t in trades
         if ("buy" in t["type"] or "purchase" in t["type"])
-        and datetime.date.fromisoformat(t["date"]) >= recent_cutoff
         and t["ticker"].isalpha()
-    ]
+    ]))[:5]
 
-    print(f"  {name}: {len(trades)} Trades, ~{return_est:.1f}% Score, {len(recent_buys)} neue Kaeufe")
+    last_5_trades = trades[:5]
+
+    print(f"  {name}: {len(trades)} Trades, ~{return_est:.1f}% Score, {len(recent_buys)} letzte Kaeufe")
     return {
         "name":        name,
         "url":         url,
         "return_pct":  return_est,
         "trade_count": len(trades),
-        "recent_buys": list(dict.fromkeys(recent_buys))
+        "recent_buys": recent_buys,
+        "last_5_trades": last_5_trades
     }
 
 # ── Portfolio-Spiegelung ───────────────────────────────────────────────────────
@@ -218,7 +220,7 @@ def build_email(politicians, orders, account):
           <td style="padding:8px 12px;border-bottom:1px solid #eee;">{i}</td>
           <td style="padding:8px 12px;border-bottom:1px solid #eee;"><b>{p['name']}</b></td>
           <td style="padding:8px 12px;border-bottom:1px solid #eee;">{p['trade_count']}</td>
-          <td style="padding:8px 12px;border-bottom:1px solid #eee;">{', '.join(p['recent_buys'][:5]) or '-'}</td>
+          <td style="padding:8px 12px;border-bottom:1px solid #eee;font-size:12px">{' | '.join([f"{t['date']} {t['ticker']} ({t['type']})" for t in p.get('last_5_trades', [])]) or '-'}</td>
         </tr>"""
 
     rows_orders = ""
@@ -247,8 +249,8 @@ def build_email(politicians, orders, account):
         <thead><tr style="background:#f5f5f5;">
           <th style="padding:8px 12px;">#</th>
           <th style="padding:8px 12px;">Name</th>
-          <th style="padding:8px 12px;">Trades</th>
-          <th style="padding:8px 12px;">Neue Kaeufe</th>
+          <th style="padding:8px 12px;">Trades gesamt</th>
+          <th style="padding:8px 12px;">Letzte 5 Trades</th>
         </tr></thead>
         <tbody>{rows_pol}</tbody>
       </table>
