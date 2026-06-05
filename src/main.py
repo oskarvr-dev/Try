@@ -75,32 +75,15 @@ def is_market_open():
 # ── SEC EDGAR Insider Trades ───────────────────────────────────────────────────
 
 def fetch_sec_insider_trades():
-    """
-    Lädt Form 4 Filings (Insider-Trades) direkt von SEC EDGAR.
-    Form 4 = Pflichtmeldung wenn CEO/CFO/Direktor Aktien kauft oder verkauft.
-    """
     print("Lade Insider-Trades von SEC EDGAR ...")
-
     cutoff = datetime.date.today() - datetime.timedelta(days=LOOKBACK_DAYS)
     start  = cutoff.strftime("%Y-%m-%d")
-    end    = datetime.date.today().strftime("%Y-%m-%d")
-
-    # SEC EDGAR Full-Text Search API
-    url = (
-        f"https://efts.sec.gov/LATEST/search-index?q=%22P%22"
-        f"&dateRange=custom&startdt={start}&enddt={end}"
-        f"&forms=4&hits.hits._source=period_of_report,display_names,file_date"
-        f"&hits.hits.total.value=true&hits.hits.hits.total=500"
-    )
-
-    # Alternativer Endpunkt: EDGAR RSS Feed für Form 4
-    rss_url = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&dateb=&owner=include&count=100&search_text=&output=atom"
 
     trades = []
 
     # Methode 1: EDGAR RSS Feed
     try:
-        print("  Versuche SEC RSS Feed ...")
+        rss_url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&dateb=&owner=include&count=100&search_text=&output=atom"
         r = requests.get(rss_url, headers=SEC_HEADERS, timeout=20)
         r.raise_for_status()
         root = ET.fromstring(r.content)
@@ -108,69 +91,42 @@ def fetch_sec_insider_trades():
         entries = root.findall("atom:entry", ns)
         print(f"  {len(entries)} Form-4 Eintraege gefunden")
 
-        for entry in entries[:50]:
+        for entry in entries:
             title   = entry.findtext("atom:title", "", ns)
             updated = entry.findtext("atom:updated", "", ns)[:10]
-            link_el = entry.find("atom:link", ns)
-            link    = link_el.get("href", "") if link_el is not None else ""
+            print(f"  RAW: {title}")  # Debug jedes Entry
 
-            # Ticker aus dem Filing-Link extrahieren
-            # Format: "4 - COMPANYNAME (TICKER) (0001234567) (Issuer)"
+            import re
+            # Suche Ticker in Klammern - z.B. (AAPL) oder (NVDA)
+            matches = re.findall(r'([A-Z]{1,5})', title)
             ticker = ""
-            if "(" in title and ")" in title:
-                parts = title.split("(")
-                for part in parts[1:]:
-                    candidate = part.split(")")[0].strip()
-                    if candidate.isupper() and 1 <= len(candidate) <= 5 and candidate.isalpha():
-                        ticker = candidate
-                        break
+            skip = {"SEC", "EDGAR", "THE", "AND", "FOR", "LLC", "INC", "CORP", "LTD", "CO"}
+            for m in matches:
+                if m not in skip and m.isalpha() and 1 <= len(m) <= 5:
+                    ticker = m
+                    break
 
-            name = title.split(" - ")[1].split(" (")[0] if " - " in title else title
+            name = title.split(" - ")[1].strip() if " - " in title else title.strip()
+            name = re.sub(r'\s*\(.*?\)\s*', ' ', name).strip()
 
             if ticker:
-                # Jedes Issuer-Entry zaehlt als potenzieller Kauf (Form 4 P-Transaktion)
                 trades.append({
-                    "name":   name,
-                    "ticker": ticker,
-                    "date":   updated,
-                    "type":   "purchase",
-                    "score":  50,
-                    "link":   link
+                    "name": name, "ticker": ticker,
+                    "date": updated, "type": "purchase", "score": 50
                 })
 
         if trades:
-            print(f"  {len(trades)} Insider-Trades mit Ticker extrahiert")
+            print(f"  {len(trades)} Trades mit Ticker extrahiert")
             return trades
+        else:
+            print("  Kein Ticker gefunden - nutze Fallback")
 
     except Exception as e:
-        print(f"  RSS Feed Fehler: {e}")
+        print(f"  RSS Fehler: {e}")
 
-    # Methode 2: EDGAR JSON API
-    try:
-        print("  Versuche SEC EDGAR JSON API ...")
-        json_url = f"https://efts.sec.gov/LATEST/search-index?q=%22transaction+code%22+%22P%22&forms=4&dateRange=custom&startdt={start}&enddt={end}"
-        r = requests.get(json_url, headers=SEC_HEADERS, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        hits = data.get("hits", {}).get("hits", [])
-        print(f"  {len(hits)} Treffer")
-        for hit in hits[:100]:
-            src = hit.get("_source", {})
-            names = src.get("display_names", [])
-            name  = names[0] if names else "Unbekannt"
-            date  = src.get("period_of_report", src.get("file_date", ""))[:10]
-            tickers = src.get("entity_id", "")
-            trades.append({
-                "name": name, "ticker": "", "date": date, "type": "purchase"
-            })
-        if trades:
-            return trades
-    except Exception as e:
-        print(f"  JSON API Fehler: {e}")
-
-    # Methode 3: Fallback mit bekannten aktiven Insidern (hartcodiert als Backup)
-    print("  Nutze Fallback-Daten (bekannte aktive Insider) ...")
-    fallback = [
+    # Fallback: bekannte Top-Insider
+    print("  Nutze Fallback-Daten ...")
+    return [
         {"name": "Jensen Huang (NVIDIA)",    "ticker": "NVDA", "date": start, "type": "purchase", "score": 95},
         {"name": "Elon Musk (Tesla)",         "ticker": "TSLA", "date": start, "type": "purchase", "score": 90},
         {"name": "Mark Zuckerberg (Meta)",    "ticker": "META", "date": start, "type": "purchase", "score": 88},
@@ -180,7 +136,6 @@ def fetch_sec_insider_trades():
         {"name": "Sundar Pichai (Alphabet)",  "ticker": "GOOGL","date": start, "type": "purchase", "score": 78},
         {"name": "Jamie Dimon (JPMorgan)",    "ticker": "JPM",  "date": start, "type": "purchase", "score": 75},
     ]
-    return fallback
 
 def rank_insiders(trades):
     """Gruppiert Trades nach Insider und berechnet Kauf-Score."""
